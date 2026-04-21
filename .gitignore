@@ -34,6 +34,7 @@ env/
 *.swo
 *~
 .DS_Store
+.snow/
 
 # Environment Variables
 .env
@@ -53,3 +54,4 @@ htmlcov/
 
 # Project specific
 .ace-tool/
+AGENTS.md
