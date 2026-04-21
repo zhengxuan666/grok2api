@@ -11,6 +11,8 @@ from threading import Lock
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
+import asyncio
+
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
 
@@ -44,6 +46,7 @@ accounts_table = sa.Table(
     sa.Column("quota_fast",       sa.Text,    nullable=False, default="{}"),
     sa.Column("quota_expert",     sa.Text,    nullable=False, default="{}"),
     sa.Column("quota_heavy",      sa.Text,    nullable=False, default="{}"),
+    sa.Column("quota_grok_4_3",   sa.Text,    nullable=False, default="{}"),
     sa.Column("usage_use_count",  sa.Integer, nullable=False, default=0),
     sa.Column("usage_fail_count", sa.Integer, nullable=False, default=0),
     sa.Column("usage_sync_count", sa.Integer, nullable=False, default=0),
@@ -330,11 +333,11 @@ def _build_sql_connect_args(
         return {"ssl": ctx} if ctx is not None else None
 
     _validate_pg_ssl_options(mode, ssl_options)
-    if _has_ssl_options(ssl_options, _PG_SSL_CERT_PARAM_KEYS):
-        return {"ssl": _build_pg_ssl_context(mode, ssl_options)}
     if mode == "disable":
         return None
-    return {"ssl": mode}
+    # asyncpg does not accept ssl= as a plain string (e.g. "require").
+    # Always build a proper ssl.SSLContext so the driver can use it directly.
+    return {"ssl": _build_pg_ssl_context(mode, ssl_options)}
 
 
 def _prepare_sql_url_and_connect_args(
@@ -350,10 +353,22 @@ def _prepare_sql_url_and_connect_args(
     return cleaned_url, _build_sql_connect_args(dialect, ssl_options)
 
 
+def _is_serverless() -> bool:
+    """Detect common serverless environments (Vercel, AWS Lambda, etc.)."""
+    return bool(
+        os.getenv("VERCEL")
+        or os.getenv("AWS_LAMBDA_FUNCTION_NAME")
+        or os.getenv("FUNCTIONS_WORKER_RUNTIME")  # Azure Functions
+    )
+
+
 def _sql_engine_kwargs(connect_args: dict[str, Any] | None) -> dict[str, Any]:
+    # In serverless environments each function instance is short-lived and may
+    # run concurrently.  Keep pools small to avoid exhausting DB connections.
+    serverless = _is_serverless()
     kwargs: dict[str, Any] = {
-        "pool_size": _get_env_int("ACCOUNT_SQL_POOL_SIZE", 5, minimum=1),
-        "max_overflow": _get_env_int("ACCOUNT_SQL_MAX_OVERFLOW", 10, minimum=0),
+        "pool_size":    _get_env_int("ACCOUNT_SQL_POOL_SIZE",    1 if serverless else 5,  minimum=1),
+        "max_overflow": _get_env_int("ACCOUNT_SQL_MAX_OVERFLOW", 2 if serverless else 10, minimum=0),
         "pool_timeout": _get_env_int("ACCOUNT_SQL_POOL_TIMEOUT", 30, minimum=1),
         "pool_recycle": _get_env_int("ACCOUNT_SQL_POOL_RECYCLE", 1800, minimum=0),
         "pool_pre_ping": True,
@@ -390,13 +405,16 @@ def _evict_cached_engine(engine: AsyncEngine) -> None:
 def _row_to_record(row: Any) -> AccountRecord:
     d = dict(row._mapping)
     d["tags"]  = json.loads(d.get("tags")  or "[]")
-    heavy_raw  = d.pop("quota_heavy", "{}") or "{}"
-    heavy_dict = json.loads(heavy_raw)
+    heavy_raw     = d.pop("quota_heavy",    "{}") or "{}"
+    grok_4_3_raw  = d.pop("quota_grok_4_3", "{}") or "{}"
+    heavy_dict    = json.loads(heavy_raw)
+    grok_4_3_dict = json.loads(grok_4_3_raw)
     d["quota"] = {
         "auto":   json.loads(d.pop("quota_auto",   "{}") or "{}"),
         "fast":   json.loads(d.pop("quota_fast",   "{}") or "{}"),
         "expert": json.loads(d.pop("quota_expert", "{}") or "{}"),
-        **({"heavy": heavy_dict} if heavy_dict else {}),
+        **({"heavy":    heavy_dict}    if heavy_dict    else {}),
+        **({"grok_4_3": grok_4_3_dict} if grok_4_3_dict else {}),
     }
     d["ext"] = json.loads(d.get("ext") or "{}")
     return AccountRecord.model_validate(d)
@@ -412,10 +430,12 @@ class SqlAccountRepository:
         dialect: str = "mysql",
         dispose_engine: bool = True,
     ) -> None:
-        self._engine  = engine
-        self._dialect = dialect   # "mysql" | "postgresql"
-        self._session = async_sessionmaker(engine, expire_on_commit=False)
+        self._engine       = engine
+        self._dialect      = dialect   # "mysql" | "postgresql"
+        self._session      = async_sessionmaker(engine, expire_on_commit=False)
         self._dispose_engine = dispose_engine
+        self._initialized  = False
+        self._init_lock    = asyncio.Lock()
 
     # ------------------------------------------------------------------
     # Revision helpers (run inside a transaction)
@@ -463,9 +483,26 @@ class SqlAccountRepository:
     # Public API
     # ------------------------------------------------------------------
 
-    async def initialize(self) -> None:
+    async def _ensure_initialized(self) -> None:
+        """Idempotent: create tables + seed revision row if not already done.
+
+        Safe to call on every request — short-circuits after first success so
+        repeated calls cost only an asyncio lock check.  This allows the
+        repository to self-initialise even when the ASGI lifespan is not
+        executed (e.g. Vercel serverless cold-starts).
+        """
+        if self._initialized:
+            return
+        async with self._init_lock:
+            if self._initialized:
+                return
+            await self._do_initialize()
+            self._initialized = True
+
+    async def _do_initialize(self) -> None:
         async with self._engine.begin() as conn:
             await conn.run_sync(metadata.create_all)
+            await self._ensure_columns(conn)
             # Seed revision row.
             if self._dialect == "postgresql":
                 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -482,11 +519,44 @@ class SqlAccountRepository:
                     .on_duplicate_key_update(value="0")
                 )
 
+    async def _ensure_columns(self, conn: Any) -> None:
+        """Idempotent ALTER TABLE migrations for columns added after the initial schema."""
+        existing = await self._table_columns(conn, _TBL_ACCOUNTS)
+        if "quota_grok_4_3" not in existing:
+            await conn.exec_driver_sql(
+                f"ALTER TABLE {_TBL_ACCOUNTS} "
+                f"ADD COLUMN quota_grok_4_3 TEXT NOT NULL DEFAULT '{{}}'"
+            )
+
+    async def _table_columns(self, conn: Any, table: str) -> set[str]:
+        if self._dialect == "postgresql":
+            rows = await conn.execute(
+                sa.text(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_name = :t"
+                ),
+                {"t": table},
+            )
+        else:
+            rows = await conn.execute(
+                sa.text(
+                    "SELECT COLUMN_NAME FROM information_schema.columns "
+                    "WHERE table_schema = DATABASE() AND table_name = :t"
+                ),
+                {"t": table},
+            )
+        return {str(r[0]).lower() for r in rows.fetchall()}
+
+    async def initialize(self) -> None:
+        await self._ensure_initialized()
+
     async def get_revision(self) -> int:
+        await self._ensure_initialized()
         async with self._engine.connect() as conn:
             return await self._get_revision(conn)
 
     async def runtime_snapshot(self) -> RuntimeSnapshot:
+        await self._ensure_initialized()
         async with self._engine.connect() as conn:
             rev = await self._get_revision(conn)
             rows = (await conn.execute(
@@ -500,6 +570,7 @@ class SqlAccountRepository:
         *,
         limit: int = 5000,
     ) -> AccountChangeSet:
+        await self._ensure_initialized()
         async with self._engine.connect() as conn:
             rev = await self._get_revision(conn)
             rows = (await conn.execute(
@@ -529,6 +600,7 @@ class SqlAccountRepository:
     ) -> AccountMutationResult:
         if not items:
             return AccountMutationResult()
+        await self._ensure_initialized()
         async with self._engine.begin() as conn:
             rev = await self._bump_revision(conn)
             ts  = now_ms()
@@ -551,7 +623,8 @@ class SqlAccountRepository:
                     "quota_auto":       json.dumps(qs.auto.to_dict()),
                     "quota_fast":       json.dumps(qs.fast.to_dict()),
                     "quota_expert":     json.dumps(qs.expert.to_dict()),
-                    "quota_heavy":      json.dumps(qs.heavy.to_dict()) if qs.heavy else "{}",
+                    "quota_heavy":      json.dumps(qs.heavy.to_dict())    if qs.heavy    else "{}",
+                    "quota_grok_4_3":   json.dumps(qs.grok_4_3.to_dict()) if qs.grok_4_3 else "{}",
                     "usage_use_count":  0,
                     "usage_fail_count": 0,
                     "usage_sync_count": 0,
@@ -568,6 +641,7 @@ class SqlAccountRepository:
     ) -> AccountMutationResult:
         if not patches:
             return AccountMutationResult()
+        await self._ensure_initialized()
         async with self._engine.begin() as conn:
             rev = await self._bump_revision(conn)
             ts  = now_ms()
@@ -605,6 +679,8 @@ class SqlAccountRepository:
                     updates["quota_expert"] = json.dumps(patch.quota_expert)
                 if patch.quota_heavy is not None:
                     updates["quota_heavy"] = json.dumps(patch.quota_heavy)
+                if patch.quota_grok_4_3 is not None:
+                    updates["quota_grok_4_3"] = json.dumps(patch.quota_grok_4_3)
                 if patch.usage_use_delta is not None:
                     updates["usage_use_count"] = max(0, record.usage_use_count + patch.usage_use_delta)
                 if patch.usage_fail_delta is not None:
@@ -652,6 +728,7 @@ class SqlAccountRepository:
     ) -> AccountMutationResult:
         if not tokens:
             return AccountMutationResult()
+        await self._ensure_initialized()
         async with self._engine.begin() as conn:
             rev = await self._bump_revision(conn)
             ts  = now_ms()
@@ -671,6 +748,7 @@ class SqlAccountRepository:
     ) -> list[AccountRecord]:
         if not tokens:
             return []
+        await self._ensure_initialized()
         async with self._engine.connect() as conn:
             rows = (await conn.execute(
                 sa.select(accounts_table).where(accounts_table.c.token.in_(tokens))
@@ -681,6 +759,7 @@ class SqlAccountRepository:
         self,
         query: ListAccountsQuery,
     ) -> AccountPage:
+        await self._ensure_initialized()
         async with self._engine.connect() as conn:
             stmt = sa.select(accounts_table)
             if not query.include_deleted:
@@ -718,6 +797,7 @@ class SqlAccountRepository:
         self,
         command: BulkReplacePoolCommand,
     ) -> AccountMutationResult:
+        await self._ensure_initialized()
         async with self._engine.begin() as conn:
             rev = await self._bump_revision(conn)
             ts  = now_ms()
